@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "observability-log-py"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python observability helpers for trace/log correlation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,14 @@ dependencies = [
   "opentelemetry-api>=1.39.0",
 ]
 
+[project.optional-dependencies]
+langfuse = [
+  "langfuse>=3.14.5",
+  "opentelemetry-sdk>=1.39.0",
+  "litellm>=1.80.7",
+  "starlette>=0.40.0",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["obslogpy*"]
-
