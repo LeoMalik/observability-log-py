@@ -6,6 +6,8 @@ Python 二方观测日志库，提供：
 - 基于 FastAPI 的 access log + `X-Trace-Id` 响应头中间件
 - 可选响应体预览（限长+脱敏）
 - Langfuse 追踪封装（HTTP span + LiteLLM generation + 统一 open span 入口）
+- OTel 初始化与日志相关配置
+- Span 常用 helper（批量 attributes、链式错误处理）
 
 ## 安装
 
@@ -22,22 +24,25 @@ pip install "observability-log-py[langfuse]"
 ## 使用示例
 
 ```python
-import logging
 from fastapi import FastAPI
-from obslogpy.fastapi import TraceAccessLogMiddleware
-from obslogpy import log_json
-
-logger = logging.getLogger("mail-mvp")
-app = FastAPI()
-app.add_middleware(
-    TraceAccessLogMiddleware,
-    logger=logger,
-    enable_response_body_preview=True,
-    response_body_preview_max_bytes=2048,
-    response_body_preview_paths=["/api/generate-company-summary"],
+from obslogpy import (
+    SpanOps,
+    add_fastapi_observability,
+    configure_logging,
+    init_otel,
+    log_json,
 )
 
+logger = configure_logging("mail-mvp")
+init_otel("mail-mvp", logger)
+
+app = FastAPI()
+add_fastapi_observability(app, logger)  # 默认读取 OBS_HTTP_BODY_PREVIEW_* 等环境变量
+
 log_json(logger, "Email.Generate", "request accepted", fields={"user_id": 42})
+
+def mark_error(span, err):
+    SpanOps(span).error(err, error_code="DEMO_ERROR")
 ```
 
 ## Langfuse 最小侵入接入

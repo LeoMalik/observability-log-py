@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Callable
 
@@ -10,7 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from .logging import build_body_preview, log_json
+from .logging import DEFAULT_REDACT_KEYS, build_body_preview, log_json
 
 
 class TraceAccessLogMiddleware(BaseHTTPMiddleware):
@@ -164,4 +165,62 @@ class TraceAccessLogMiddleware(BaseHTTPMiddleware):
         merged = b"".join(chunks)
         response.body_iterator = iterate_in_threadpool(iter([merged]))
         return merged
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _parse_csv_env(name: str, default: list[str] | None = None) -> list[str]:
+    raw = os.getenv(name, "")
+    if not raw and default is not None:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def add_fastapi_observability(app, logger, **overrides):
+    trace_header_name = overrides.get(
+        "trace_header_name",
+        os.getenv("OBS_TRACE_HEADER_NAME", "X-Trace-Id"),
+    )
+    enable_response_body_preview = overrides.get(
+        "enable_response_body_preview",
+        _parse_bool_env("OBS_HTTP_BODY_PREVIEW_ENABLED", True),
+    )
+    response_body_preview_max_bytes = overrides.get(
+        "response_body_preview_max_bytes",
+        _parse_int_env("OBS_HTTP_BODY_PREVIEW_MAX_BYTES", 2048),
+    )
+    response_body_preview_paths = overrides.get(
+        "response_body_preview_paths",
+        _parse_csv_env("OBS_HTTP_BODY_PREVIEW_PATHS"),
+    )
+    response_body_preview_redact_keys = overrides.get(
+        "response_body_preview_redact_keys",
+        _parse_csv_env("OBS_HTTP_BODY_PREVIEW_REDACT_KEYS", sorted(DEFAULT_REDACT_KEYS)),
+    )
+    app.add_middleware(
+        TraceAccessLogMiddleware,
+        logger=logger,
+        trace_header_name=trace_header_name,
+        enable_response_body_preview=enable_response_body_preview,
+        response_body_preview_max_bytes=response_body_preview_max_bytes,
+        response_body_preview_paths=response_body_preview_paths,
+        response_body_preview_redact_keys=response_body_preview_redact_keys,
+    )
+    return app
 
