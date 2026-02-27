@@ -50,18 +50,28 @@ def mark_error(span, err):
 ```python
 from fastapi import FastAPI
 from obslogpy.langfuse.fastapi import add_langfuse_tracing
-from obslogpy.langfuse.litellm import instrumented_acompletion
+from obslogpy.langfuse.litellm import (
+    build_trace_headers,
+    observed_instrumented_acompletion,
+)
 
 app = FastAPI()
 add_langfuse_tracing(app)  # 从环境变量自动读取配置并决定是否启用
 
-# 业务代码只调封装函数，不直接调 start_as_current_span/start_as_current_observation
-resp = await instrumented_acompletion(
-    name="EmailWriteClient.generate_body_custom",
+# 业务代码只调封装函数，不直接调 start_as_current_span/set_attribute 等 tracing 细节
+headers = build_trace_headers(user_id="u-1", session_id="s-1")
+resp = await observed_instrumented_acompletion(
+    tracer_name="mail-mvp/llm/email-write",
+    span_name="EmailWriteClient.custom_email_acompletion",
+    generation_name="EmailWriteClient.generate_body_custom",
     model="litellm_proxy/google/gemini-2.5-pro",
-    messages=[{"role": "user", "content": "hello"}],
     base_url="http://127.0.0.1",
     api_key="***",
+    messages=[{"role": "user", "content": "hello"}],
+    user_id="u-1",
+    session_id="s-1",
+    request_payload={"model": "litellm_proxy/google/gemini-2.5-pro"},
+    extra_headers=headers,
 )
 ```
 

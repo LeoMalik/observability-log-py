@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import json
 import logging
+import time
 from typing import Any
 
 from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from .client import get_langfuse, open_observation
 from .config import LangfuseSettings
 from .context import preserve_otel_parent_span
 
 logger = logging.getLogger(__name__)
+DEFAULT_TRACE_UUID = "123e4567-e89b-12d3-a456-426614174000"
 
 try:
     from litellm import acompletion
@@ -77,6 +81,29 @@ def _extract_model_parameters(kwargs: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _preview_json(value: object, max_bytes: int = 4096) -> tuple[str, bool, int]:
+    encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return encoded.decode("utf-8", errors="replace"), False, len(encoded)
+    return encoded[:max_bytes].decode("utf-8", errors="replace"), True, len(encoded)
+
+
+def build_trace_headers(
+    *,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    include_uuid: bool = True,
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if user_id:
+        headers["X-User-ID"] = user_id
+        if include_uuid:
+            headers["X-UUID"] = DEFAULT_TRACE_UUID
+    if session_id:
+        headers["X-Session-ID"] = session_id
+    return headers
+
+
 async def instrumented_acompletion(
     *,
     name: str,
@@ -135,4 +162,86 @@ async def instrumented_acompletion(
                 )
             except Exception:
                 logger.warning("Langfuse generation.update failed", exc_info=True)
+        return resp
+
+
+async def observed_instrumented_acompletion(
+    *,
+    tracer_name: str,
+    span_name: str,
+    generation_name: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    base_url: str | None = None,
+    api_key: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    request_payload: dict[str, Any] | None = None,
+    extra_span_attrs: dict[str, Any] | None = None,
+    preview_max_bytes: int = 4096,
+    settings: LangfuseSettings | None = None,
+    **kwargs: Any,
+) -> Any:
+    """High-level wrapper that keeps business code free from tracing details."""
+    tracer = trace.get_tracer(tracer_name)
+    with tracer.start_as_current_span(span_name) as span:
+        span.set_attribute("llm.model", model)
+        if user_id:
+            span.set_attribute("app.user_id", user_id)
+        if session_id:
+            span.set_attribute("app.session_id", session_id)
+        if extra_span_attrs:
+            for key, value in extra_span_attrs.items():
+                if value is not None:
+                    span.set_attribute(key, value)
+
+        if request_payload is not None:
+            req_preview, req_truncated, req_size = _preview_json(
+                request_payload,
+                max_bytes=preview_max_bytes,
+            )
+            span.set_attribute("http_request_body_preview", req_preview)
+            span.set_attribute("http_request_body_preview_truncated", req_truncated)
+            span.set_attribute("http_request_body_size", req_size)
+
+        call_kwargs = dict(kwargs)
+        if base_url is not None:
+            call_kwargs["base_url"] = base_url
+        if api_key is not None:
+            call_kwargs["api_key"] = api_key
+
+        start = time.perf_counter()
+        try:
+            resp = await instrumented_acompletion(
+                name=generation_name,
+                model=model,
+                messages=messages,
+                settings=settings,
+                **call_kwargs,
+            )
+        except Exception as err:
+            span.record_exception(err)
+            span.set_status(StatusCode.ERROR, str(err))
+            raise
+
+        duration_ms = (time.perf_counter() - start) * 1000
+        span.set_attribute("llm.duration_ms", round(duration_ms, 3))
+
+        resp_preview, resp_truncated, resp_size = _preview_json(
+            resp,
+            max_bytes=preview_max_bytes,
+        )
+        span.set_attribute("http_response_body_preview", resp_preview)
+        span.set_attribute("http_response_body_preview_truncated", resp_truncated)
+        span.set_attribute("http_response_body_size", resp_size)
+
+        content = (
+            resp.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            if isinstance(resp, dict)
+            else ""
+        )
+        if isinstance(content, str):
+            span.set_attribute("llm.output_length", len(content))
         return resp

@@ -15,7 +15,12 @@ from .fastapi import (
     resolve_langfuse_session_id,
     resolve_langfuse_trace_id,
 )
-from .litellm import instrumented_acompletion
+from .litellm import (
+    DEFAULT_TRACE_UUID,
+    build_trace_headers,
+    instrumented_acompletion,
+    observed_instrumented_acompletion,
+)
 
 __all__ = [
     "LangfuseSettings",
@@ -26,6 +31,9 @@ __all__ = [
     "get_langfuse",
     "instrumented_acompletion",
     "langfuse_flush_at_request_end",
+    "build_trace_headers",
+    "observed_instrumented_acompletion",
+    "DEFAULT_TRACE_UUID",
     "open_observation",
     "open_span",
     "preserve_otel_parent_span",
