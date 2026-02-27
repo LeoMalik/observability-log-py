@@ -88,6 +88,28 @@ def _preview_json(value: object, max_bytes: int = 4096) -> tuple[str, bool, int]
     return encoded[:max_bytes].decode("utf-8", errors="replace"), True, len(encoded)
 
 
+def _build_default_request_payload(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    for key, value in kwargs.items():
+        if key == "api_key":
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (bool, int, float, str, list, dict)):
+            payload[key] = value
+        else:
+            payload[key] = str(value)
+    return payload
+
+
 def build_trace_headers(
     *,
     user_id: str | None = None,
@@ -195,9 +217,14 @@ async def observed_instrumented_acompletion(
                 if value is not None:
                     span.set_attribute(key, value)
 
-        if request_payload is not None:
+        effective_request_payload = request_payload or _build_default_request_payload(
+            model=model,
+            messages=messages,
+            kwargs=kwargs,
+        )
+        if effective_request_payload is not None:
             req_preview, req_truncated, req_size = _preview_json(
-                request_payload,
+                effective_request_payload,
                 max_bytes=preview_max_bytes,
             )
             span.set_attribute("http_request_body_preview", req_preview)

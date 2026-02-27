@@ -80,11 +80,8 @@ def test_observed_instrumented_acompletion_success(monkeypatch) -> None:
             messages=[{"role": "user", "content": "hi"}],
             user_id="u-1",
             session_id="s-1",
-            request_payload={
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "hi"}],
-            },
             timeout=3,
+            max_completion_tokens=12,
         )
     )
 
@@ -94,6 +91,7 @@ def test_observed_instrumented_acompletion_success(monkeypatch) -> None:
     assert fake_tracer.last_span.attrs["app.user_id"] == "u-1"
     assert fake_tracer.last_span.attrs["app.session_id"] == "s-1"
     assert "http_request_body_preview" in fake_tracer.last_span.attrs
+    assert "\"model\": \"test-model\"" in str(fake_tracer.last_span.attrs["http_request_body_preview"])
     assert "http_response_body_preview" in fake_tracer.last_span.attrs
     assert fake_tracer.last_span.attrs["llm.output_length"] == 5
 
