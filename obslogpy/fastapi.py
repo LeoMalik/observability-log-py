@@ -2,128 +2,260 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Callable
 
+from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 from opentelemetry.trace import SpanKind, StatusCode
-from starlette.concurrency import iterate_in_threadpool
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
 
 from .logging import DEFAULT_REDACT_KEYS, build_body_preview, log_json
 
 
-class TraceAccessLogMiddleware(BaseHTTPMiddleware):
+class TraceAccessLogMiddleware:
+    """Pure ASGI middleware for HTTP observability.
+
+    Creates OpenTelemetry SERVER spans from incoming ``traceparent`` headers,
+    injects an ``X-Trace-Id`` response header, emits structured access logs,
+    and optionally captures request / response body previews.
+
+    This implementation does **not** inherit from Starlette's
+    ``BaseHTTPMiddleware``, which avoids the well-known issue where stacking
+    multiple ``BaseHTTPMiddleware`` layers with ``StreamingResponse`` causes
+    ``RuntimeError: Unexpected message received: http.request`` under real
+    ASGI servers (uvicorn / hypercorn).
+    """
+
     def __init__(
         self,
         app,
-        logger,
+        logger=None,
         trace_header_name: str = "X-Trace-Id",
         enable_response_body_preview: bool = False,
         response_body_preview_max_bytes: int = 2048,
         response_body_preview_paths: list[str] | None = None,
         response_body_preview_redact_keys: list[str] | None = None,
     ):
-        super().__init__(app)
+        self.app = app
         self._logger = logger
         self._trace_header_name = trace_header_name
         self._enable_response_body_preview = enable_response_body_preview
         self._response_body_preview_max_bytes = max(response_body_preview_max_bytes, 1)
-        self._response_body_preview_paths = [path.strip() for path in (response_body_preview_paths or []) if path and path.strip()]
+        self._response_body_preview_paths = [
+            path.strip()
+            for path in (response_body_preview_paths or [])
+            if path and path.strip()
+        ]
         self._response_body_preview_redact_keys = response_body_preview_redact_keys or []
 
-    async def dispatch(self, request: Request, call_next: Callable[[Request], Response]) -> Response:
-        tracer = trace.get_tracer("observability-log-py/fastapi")
+    # ------------------------------------------------------------------
+    # ASGI entry point
+    # ------------------------------------------------------------------
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+
+        # Build a plain dict of headers for propagate.extract & user-agent.
+        headers_dict: dict[str, str] = {}
+        user_agent = ""
+        for raw_key, raw_val in scope.get("headers", []):
+            name = raw_key.decode("latin-1").lower()
+            value = raw_val.decode("latin-1")
+            headers_dict[name] = value
+            if name == "user-agent":
+                user_agent = value
+
+        should_capture = self._should_capture_path(path)
         start = time.perf_counter()
-        should_capture_body = self._should_capture_path(request.url.path)
-        request_body = await self._extract_request_body(request) if should_capture_body else None
+
+        # Optionally buffer request body for preview.
+        request_body: bytes | None = None
+        if should_capture:
+            request_body, receive = await self._buffer_request_body(receive)
+
+        # If there is already a valid span (e.g. from auto-instrumentation),
+        # reuse it instead of creating a duplicate server span.
         current_span = trace.get_current_span()
         current_ctx = current_span.get_span_context() if current_span else None
-        # When auto instrumentation is enabled, reuse current server span to avoid duplicate server spans.
+
         if current_ctx and current_ctx.is_valid:
-            try:
-                response = await call_next(request)
-            except Exception as err:
-                current_span.record_exception(err)
-                current_span.set_status(StatusCode.ERROR, str(err))
-                raise
-            return await self._finalize_response(current_span, request, response, start, request_body)
+            status_code, response_body = await self._traced_call(
+                scope, receive, send, current_span, should_capture,
+            )
+        else:
+            parent_ctx = propagate.extract(headers_dict)
+            tracer = trace.get_tracer("observability-log-py/fastapi")
+            with tracer.start_as_current_span(
+                f"{method} {path}",
+                context=parent_ctx,
+                kind=SpanKind.SERVER,
+            ) as span:
+                status_code, response_body = await self._traced_call(
+                    scope, receive, send, span, should_capture,
+                )
 
-        parent_ctx = propagate.extract(request.headers)
-        with tracer.start_as_current_span(
-            f"{request.method} {request.url.path}",
-            context=parent_ctx,
-            kind=SpanKind.SERVER,
-        ) as span:
-            try:
-                response = await call_next(request)
-            except Exception as err:
-                span.record_exception(err)
-                span.set_status(StatusCode.ERROR, str(err))
-                raise
-            return await self._finalize_response(span, request, response, start, request_body)
+        # Structured access log (always, regardless of body capture).
+        duration_ms = round((time.perf_counter() - start) * 1000, 3)
+        self._emit_access_log(
+            method, path, status_code, duration_ms, user_agent,
+            request_body, response_body, should_capture,
+        )
 
-    async def _finalize_response(
-        self,
-        span,
-        request: Request,
-        response: Response,
-        start: float,
-        request_body: bytes | None,
-    ) -> Response:
-        duration_ms = (time.perf_counter() - start) * 1000
-        span_context = span.get_span_context()
-        if span_context and span_context.is_valid:
-            response.headers[self._trace_header_name] = format(span_context.trace_id, "032x")
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        if response.status_code >= 500:
+    async def _traced_call(self, scope, receive, send, span, should_capture):
+        """Run the downstream ASGI app, intercept response start/body."""
+        status_code = 500
+        response_body_chunks: list[bytes] = []
+        trace_header_name_lower = self._trace_header_name.lower().encode("latin-1")
+
+        async def send_wrapper(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message.get("status", 500)
+                # Inject X-Trace-Id header.
+                span_ctx = span.get_span_context()
+                if span_ctx and span_ctx.is_valid:
+                    trace_id_bytes = format(span_ctx.trace_id, "032x").encode("latin-1")
+                    headers = list(message.get("headers", []))
+                    headers.append((trace_header_name_lower, trace_id_bytes))
+                    message = {**message, "headers": headers}
+            elif message["type"] == "http.response.body" and should_capture:
+                body = message.get("body", b"")
+                if body:
+                    response_body_chunks.append(body)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as err:
+            span.record_exception(err)
+            span.set_status(StatusCode.ERROR, str(err))
+            raise
+
+        # Finalize span attributes.
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+        start = scope.get("_obs_start")  # not used; duration computed by caller
+        if status_code >= 500:
             span.set_status(StatusCode.ERROR)
         else:
             span.set_status(StatusCode.OK)
-        span.set_attribute("http.method", request.method)
-        span.set_attribute("http.target", request.url.path)
-        span.set_attribute("http.status_code", response.status_code)
-        span.set_attribute("http.server_duration_ms", round(duration_ms, 3))
+        span.set_attribute("http.method", method)
+        span.set_attribute("http.target", path)
+        span.set_attribute("http.status_code", status_code)
 
-        fields = {
-            "http_method": request.method,
-            "http_path": request.url.path,
-            "http_status": response.status_code,
-            "duration_ms": round(duration_ms, 3),
-            "user_agent": request.headers.get("user-agent", ""),
+        merged_body = b"".join(response_body_chunks) if response_body_chunks else None
+        return status_code, merged_body
+
+    async def _buffer_request_body(self, receive):
+        """Read all request body chunks and return (body, replay_receive)."""
+        body_chunks: list[bytes] = []
+        while True:
+            message = await receive()
+            if message["type"] == "http.request":
+                chunk = message.get("body", b"")
+                if chunk:
+                    body_chunks.append(chunk)
+                if not message.get("more_body", False):
+                    break
+            elif message["type"] == "http.disconnect":
+                break
+            else:
+                break
+
+        full_body = b"".join(body_chunks)
+
+        # Create a receive callable that replays the body once, then
+        # delegates to the original receive for http.disconnect.
+        body_sent = False
+
+        async def replay_receive():
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": full_body, "more_body": False}
+            return await receive()
+
+        return full_body, replay_receive
+
+    def _should_capture_path(self, path: str) -> bool:
+        if not self._enable_response_body_preview:
+            return False
+        if not self._response_body_preview_paths:
+            return True
+        return any(
+            path == allowed or path.startswith(allowed)
+            for allowed in self._response_body_preview_paths
+        )
+
+    def _emit_access_log(
+        self,
+        method: str,
+        path: str,
+        status_code: int,
+        duration_ms: float,
+        user_agent: str,
+        request_body: bytes | None,
+        response_body: bytes | None,
+        should_capture: bool,
+    ) -> None:
+        if self._logger is None:
+            return
+
+        fields: dict = {
+            "http_method": method,
+            "http_path": path,
+            "http_status": status_code,
+            "duration_ms": duration_ms,
+            "user_agent": user_agent,
         }
-        if self._should_capture_path(request.url.path):
-            request_preview, request_truncated, request_size = build_body_preview(
+
+        span = trace.get_current_span()
+
+        if should_capture:
+            # Request body preview.
+            req_preview, req_truncated, req_size = build_body_preview(
                 request_body,
                 max_bytes=self._response_body_preview_max_bytes,
                 redact_keys=self._response_body_preview_redact_keys,
             )
-            if request_size > 0:
-                fields["http_request_body_size"] = request_size
-                span.set_attribute("http_request_body_size", request_size)
-            if request_preview:
-                fields["http_request_body_preview"] = request_preview
-                span.set_attribute("http_request_body_preview", request_preview)
-            if request_truncated:
+            if req_size > 0:
+                fields["http_request_body_size"] = req_size
+                if span:
+                    span.set_attribute("http_request_body_size", req_size)
+            if req_preview:
+                fields["http_request_body_preview"] = req_preview
+                if span:
+                    span.set_attribute("http_request_body_preview", req_preview)
+            if req_truncated:
                 fields["http_request_body_preview_truncated"] = True
-                span.set_attribute("http_request_body_preview_truncated", True)
+                if span:
+                    span.set_attribute("http_request_body_preview_truncated", True)
 
-            body = await self._extract_response_body(response)
-            preview, truncated, size = build_body_preview(
-                body,
+            # Response body preview.
+            resp_preview, resp_truncated, resp_size = build_body_preview(
+                response_body,
                 max_bytes=self._response_body_preview_max_bytes,
                 redact_keys=self._response_body_preview_redact_keys,
             )
-            if size > 0:
-                fields["http_response_body_size"] = size
-                span.set_attribute("http_response_body_size", size)
-            if preview:
-                fields["http_response_body_preview"] = preview
-                span.set_attribute("http_response_body_preview", preview)
-            if truncated:
+            if resp_size > 0:
+                fields["http_response_body_size"] = resp_size
+                if span:
+                    span.set_attribute("http_response_body_size", resp_size)
+            if resp_preview:
+                fields["http_response_body_preview"] = resp_preview
+                if span:
+                    span.set_attribute("http_response_body_preview", resp_preview)
+            if resp_truncated:
                 fields["http_response_body_preview_truncated"] = True
-                span.set_attribute("http_response_body_preview_truncated", True)
+                if span:
+                    span.set_attribute("http_response_body_preview_truncated", True)
 
         log_json(
             self._logger,
@@ -131,41 +263,11 @@ class TraceAccessLogMiddleware(BaseHTTPMiddleware):
             "incoming request handled",
             fields=fields,
         )
-        return response
 
-    def _should_capture_path(self, path: str) -> bool:
-        if not self._enable_response_body_preview:
-            return False
-        if not self._response_body_preview_paths:
-            return True
-        return any(path == allowed or path.startswith(allowed) for allowed in self._response_body_preview_paths)
 
-    async def _extract_request_body(self, request: Request) -> bytes | None:
-        try:
-            body = await request.body()
-        except Exception:
-            return None
-        return body if body else None
-
-    async def _extract_response_body(self, response: Response) -> bytes | None:
-        body = getattr(response, "body", None)
-        if body:
-            return body if isinstance(body, bytes) else str(body).encode("utf-8", errors="replace")
-
-        body_iterator = getattr(response, "body_iterator", None)
-        if body_iterator is None:
-            return None
-
-        chunks: list[bytes] = []
-        async for chunk in body_iterator:
-            if isinstance(chunk, bytes):
-                chunks.append(chunk)
-            else:
-                chunks.append(str(chunk).encode("utf-8", errors="replace"))
-        merged = b"".join(chunks)
-        response.body_iterator = iterate_in_threadpool(iter([merged]))
-        return merged
-
+# ---------------------------------------------------------------------------
+# Environment parsing helpers
+# ---------------------------------------------------------------------------
 
 def _parse_bool_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name, "").strip().lower()
@@ -223,4 +325,3 @@ def add_fastapi_observability(app, logger, **overrides):
         response_body_preview_redact_keys=response_body_preview_redact_keys,
     )
     return app
-
