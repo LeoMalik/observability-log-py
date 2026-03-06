@@ -2,6 +2,7 @@ from .fastapi import TraceAccessLogMiddleware, add_fastapi_observability
 from .logging import DEFAULT_REDACT_KEYS, build_body_preview, build_payload, log_json
 from .otel import configure_logging, init_otel
 from .span import SpanAttrKeys, SpanOps, set_dependency_http_attrs, set_span_attrs
+from .tracing import traced_step
 
 __all__ = [
     "DEFAULT_REDACT_KEYS",
@@ -17,6 +18,7 @@ __all__ = [
     "log_json",
     "set_dependency_http_attrs",
     "set_span_attrs",
+    "traced_step",
 ]
 
 

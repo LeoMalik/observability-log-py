@@ -8,6 +8,7 @@ Python 二方观测日志库，提供：
 - Langfuse 追踪封装（HTTP span + LiteLLM generation + 统一 open span 入口）
 - OTel 初始化与日志相关配置
 - Span 常用 helper（批量 attributes、链式错误处理）
+- 低侵入函数耗时埋点装饰器（`@traced_step`，支持 sync/async）
 
 ## 安装
 
@@ -31,6 +32,7 @@ from obslogpy import (
     configure_logging,
     init_otel,
     log_json,
+    traced_step,
 )
 
 logger = configure_logging("mail-mvp")
@@ -43,7 +45,34 @@ log_json(logger, "Email.Generate", "request accepted", fields={"user_id": 42})
 
 def mark_error(span, err):
     SpanOps(span).error(err, error_code="DEMO_ERROR")
+
+
+@traced_step("step.send_email", attrs={"biz.module": "email"})
+def send_email(recipient: str) -> str:
+    return f"sent to {recipient}"
 ```
+
+## 低侵入函数耗时埋点（traced_step）
+
+```python
+from obslogpy import traced_step
+
+
+@traced_step("pipeline.parse_input", attrs={"biz.scene": "upload"})
+def parse_input(payload: dict) -> dict:
+    return payload
+
+
+@traced_step("pipeline.score")
+async def score(payload: dict) -> dict:
+    return payload
+```
+
+说明：
+- 每次调用会创建一个 span（span 名默认为 `模块名.函数名`，也可手动传 `name`）。
+- 自动写入 `duration_ms` 到 span attributes。
+- 正常返回自动标记 `StatusCode.OK`；异常自动 `record_exception` + `StatusCode.ERROR`。
+- 建议只给关键业务步骤加 3-5 个装饰器，避免过度埋点。
 
 ## Langfuse 最小侵入接入
 
