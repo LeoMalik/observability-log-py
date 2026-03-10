@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.0] - 2026-03-06
+## [0.3.0] - 2026-03-10
 
 ### Fixed
 
@@ -16,6 +16,11 @@
 - **`_restore_request_body` helper: delegate to original receive after body consumed** — second
   call now awaits the original `receive()` (returns `http.disconnect`) instead of returning a
   second `http.request`.
+
+- **TraceAccessLogMiddleware: cap streaming response body preview and keep span attrs intact** —
+  response preview now samples only a bounded prefix (`max_bytes + 1`) while separately tracking
+  full response size, avoiding unbounded memory growth on streaming responses. Also ensures
+  `http.server_duration_ms` and body preview attributes are set on the active request span.
 
 ### Changed
 
