@@ -81,12 +81,13 @@ def extract_user_id_from_body(body: bytes, content_type: str | None) -> str | No
 
 
 def _restore_request_body(request: Request, body: bytes) -> None:
+    original_receive = request._receive
     sent = False
 
     async def receive() -> dict:
         nonlocal sent
         if sent:
-            return {"type": "http.request", "body": b"", "more_body": False}
+            return await original_receive()
         sent = True
         return {"type": "http.request", "body": body, "more_body": False}
 
@@ -137,7 +138,6 @@ class LangfuseTraceMiddleware(BaseHTTPMiddleware):
         body_session_id: str | None = None
         if request.method in _WRITE_METHODS:
             body = await request.body()
-            _restore_request_body(request, body)
             user_id, body_session_id = extract_trace_attrs_from_body(
                 body, request.headers.get("content-type")
             )
