@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import time
 
-from opentelemetry import context as otel_context
 from opentelemetry import propagate, trace
 from opentelemetry.trace import SpanKind, StatusCode
 
@@ -82,8 +81,22 @@ class TraceAccessLogMiddleware:
         current_ctx = current_span.get_span_context() if current_span else None
 
         if current_ctx and current_ctx.is_valid:
-            status_code, response_body = await self._traced_call(
+            status_code, response_body, response_body_size = await self._traced_call(
                 scope, receive, send, current_span, should_capture,
+            )
+            duration_ms = round((time.perf_counter() - start) * 1000, 3)
+            current_span.set_attribute("http.server_duration_ms", duration_ms)
+            self._emit_access_log(
+                current_span,
+                method,
+                path,
+                status_code,
+                duration_ms,
+                user_agent,
+                request_body,
+                response_body,
+                response_body_size,
+                should_capture,
             )
         else:
             parent_ctx = propagate.extract(headers_dict)
@@ -93,16 +106,23 @@ class TraceAccessLogMiddleware:
                 context=parent_ctx,
                 kind=SpanKind.SERVER,
             ) as span:
-                status_code, response_body = await self._traced_call(
+                status_code, response_body, response_body_size = await self._traced_call(
                     scope, receive, send, span, should_capture,
                 )
-
-        # Structured access log (always, regardless of body capture).
-        duration_ms = round((time.perf_counter() - start) * 1000, 3)
-        self._emit_access_log(
-            method, path, status_code, duration_ms, user_agent,
-            request_body, response_body, should_capture,
-        )
+                duration_ms = round((time.perf_counter() - start) * 1000, 3)
+                span.set_attribute("http.server_duration_ms", duration_ms)
+                self._emit_access_log(
+                    span,
+                    method,
+                    path,
+                    status_code,
+                    duration_ms,
+                    user_agent,
+                    request_body,
+                    response_body,
+                    response_body_size,
+                    should_capture,
+                )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -111,11 +131,13 @@ class TraceAccessLogMiddleware:
     async def _traced_call(self, scope, receive, send, span, should_capture):
         """Run the downstream ASGI app, intercept response start/body."""
         status_code = 500
-        response_body_chunks: list[bytes] = []
+        response_body_size = 0
+        response_preview_limit = self._response_body_preview_max_bytes + 1
+        response_preview = bytearray()
         trace_header_name_lower = self._trace_header_name.lower().encode("latin-1")
 
         async def send_wrapper(message):
-            nonlocal status_code
+            nonlocal status_code, response_body_size
             if message["type"] == "http.response.start":
                 status_code = message.get("status", 500)
                 # Inject X-Trace-Id header.
@@ -128,7 +150,10 @@ class TraceAccessLogMiddleware:
             elif message["type"] == "http.response.body" and should_capture:
                 body = message.get("body", b"")
                 if body:
-                    response_body_chunks.append(body)
+                    response_body_size += len(body)
+                    remaining = response_preview_limit - len(response_preview)
+                    if remaining > 0:
+                        response_preview.extend(body[:remaining])
             await send(message)
 
         try:
@@ -141,7 +166,6 @@ class TraceAccessLogMiddleware:
         # Finalize span attributes.
         method = scope.get("method", "GET")
         path = scope.get("path", "/")
-        start = scope.get("_obs_start")  # not used; duration computed by caller
         if status_code >= 500:
             span.set_status(StatusCode.ERROR)
         else:
@@ -150,8 +174,8 @@ class TraceAccessLogMiddleware:
         span.set_attribute("http.target", path)
         span.set_attribute("http.status_code", status_code)
 
-        merged_body = b"".join(response_body_chunks) if response_body_chunks else None
-        return status_code, merged_body
+        merged_body = bytes(response_preview) if response_preview else None
+        return status_code, merged_body, response_body_size
 
     async def _buffer_request_body(self, receive):
         """Read all request body chunks and return (body, replay_receive)."""
@@ -196,6 +220,7 @@ class TraceAccessLogMiddleware:
 
     def _emit_access_log(
         self,
+        span,
         method: str,
         path: str,
         status_code: int,
@@ -203,6 +228,7 @@ class TraceAccessLogMiddleware:
         user_agent: str,
         request_body: bytes | None,
         response_body: bytes | None,
+        response_body_size: int,
         should_capture: bool,
     ) -> None:
         if self._logger is None:
@@ -215,8 +241,6 @@ class TraceAccessLogMiddleware:
             "duration_ms": duration_ms,
             "user_agent": user_agent,
         }
-
-        span = trace.get_current_span()
 
         if should_capture:
             # Request body preview.
@@ -244,15 +268,15 @@ class TraceAccessLogMiddleware:
                 max_bytes=self._response_body_preview_max_bytes,
                 redact_keys=self._response_body_preview_redact_keys,
             )
-            if resp_size > 0:
-                fields["http_response_body_size"] = resp_size
+            if response_body_size > 0:
+                fields["http_response_body_size"] = response_body_size
                 if span:
-                    span.set_attribute("http_response_body_size", resp_size)
+                    span.set_attribute("http_response_body_size", response_body_size)
             if resp_preview:
                 fields["http_response_body_preview"] = resp_preview
                 if span:
                     span.set_attribute("http_response_body_preview", resp_preview)
-            if resp_truncated:
+            if resp_truncated or response_body_size > self._response_body_preview_max_bytes:
                 fields["http_response_body_preview_truncated"] = True
                 if span:
                     span.set_attribute("http_response_body_preview_truncated", True)
